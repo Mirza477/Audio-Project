@@ -1,0 +1,365 @@
+{
+  "name": "AKU Calling Agent → Doctor Booking (Sheets)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "aku-calling-agent",
+        "responseMode": "lastNode",
+        "options": {
+          "allowUnauthorizedCerts": true
+        }
+      },
+      "id": "WebhookTrigger",
+      "name": "Webhook (Transcripts In)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [ -620, -60 ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/*\nExpected payload (example):\n{\n  \"callerId\": \"+923001234567\",\n  \"patientName\": \"Hussain\", // optional\n  \"message\": \"I want cardiology today. Dr Sara if available now.\",\n  \"timestamp\": \"2025-10-15T15:30:00+05:00\"\n}\n*/\nconst b = items[0].json || {};\n\nreturn [{\n  json: {\n    callerId: b.callerId || \"\",\n    patientName: b.patientName || \"\",\n    message: b.message || \"\",\n    ts: b.timestamp || new Date().toISOString()\n  }\n}];"
+      },
+      "id": "NormalizeInput",
+      "name": "Normalize Input",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ -360, -60 ]
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "model": "gpt-4o-mini",
+        "chatInput": "system",
+        "systemMessage": "You are an appointment intake agent for Aga Khan University Hospital (Karachi timezone, Asia/Karachi). Extract structured data from the user's utterance. Output JSON ONLY (no prose). Fields: {\"intent\":\"book|reschedule|cancel|info\",\"doctorName\":\"\",\"specialty\":\"\",\"requestedDate\":\"ISO or empty\",\"requestedTime\":\"24h or empty\",\"asap\":true|false}. If user provides only specialty (e.g., cardiology) infer doctorName empty. If they say \"now\" or \"today asap\" set asap true.",
+        "message": "={{$json[\"message\"]}}",
+        "temperature": 0.2,
+        "jsonOutput": true
+      },
+      "id": "LLM_Parse",
+      "name": "AI: Parse Request",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 4,
+      "position": [ -90, -60 ],
+      "credentials": {
+        "openAiApi": {
+          "id": "REPLACE_WITH_YOUR_OPENAI_CRED_ID",
+          "name": "OpenAI API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "const p = items[0].json || {};\nconst out = p?.data || p; // n8n OpenAI JSON output is under .data\nconst now = new Date();\n\nreturn [{ json: {\n  intent: out.intent || \"book\",\n  doctorName: out.doctorName || \"\",\n  specialty: out.specialty || \"\",\n  requestedDate: out.requestedDate || \"\",\n  requestedTime: out.requestedTime || \"\",\n  asap: !!out.asap,\n  callerId: $items(\"Normalize Input\", 0, 0).json.callerId,\n  patientName: $items(\"Normalize Input\", 0, 0).json.patientName,\n  message: $items(\"Normalize Input\", 0, 0).json.message,\n  ts: $items(\"Normalize Input\", 0, 0).json.ts,\n  nowISO: now.toISOString()\n}}];"
+      },
+      "id": "ShapeParsed",
+      "name": "Shape Parsed JSON",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ 140, -60 ]
+    },
+    {
+      "parameters": {
+        "operation": "lookup",
+        "sheetId": "REPLACE_WITH_YOUR_SPREADSHEET_ID",
+        "range": "Doctors!A:H",
+        "lookupColumn": "Name",
+        "lookupValue": "={{$json[\"doctorName\"]}}",
+        "options": {
+          "continue": true
+        }
+      },
+      "id": "GS_FindDoctorByName",
+      "name": "GS: Find Doctor (by Name)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 5,
+      "position": [ 400, -160 ],
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_WITH_YOUR_GOOGLE_CRED_ID",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "sheetId": "REPLACE_WITH_YOUR_SPREADSHEET_ID",
+        "range": "Doctors!A:H",
+        "options": {}
+      },
+      "id": "GS_ReadAllDoctors",
+      "name": "GS: Read All Doctors",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 5,
+      "position": [ 400, 60 ],
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_WITH_YOUR_GOOGLE_CRED_ID",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "/*\nInput from two branches:\n- If doctorName provided and found: GS_FindDoctorByName\n- Else: GS_ReadAllDoctors (filter by specialty)\nWe will choose doctor rows accordingly.\nColumns: A:DoctorID, B:Name, C:Specialty, D:SittingDaysCSV, E:StartTime24h, F:EndTime24h, G:SlotMinutes, H:Location\n*/\n\nconst parsed = $items(\"Shape Parsed JSON\", 0, 0).json;\nlet rows = [];\n\nif (parsed.doctorName) {\n  const found = $items(\"GS: Find Doctor (by Name)\", 0, 0)?.json || {};\n  if (Object.keys(found).length) rows = [found];\n} else {\n  const all = $items(\"GS: Read All Doctors\", 0, 0)?.json || [];\n  rows = (Array.isArray(all) ? all : [all]).filter(r => (r.C || r[\"Column 3\"])?.toLowerCase?.().includes((parsed.specialty||\"\").toLowerCase()));\n}\n\nreturn [{ json: { parsed, doctorRows: rows } }];"
+      },
+      "id": "PickDoctorRows",
+      "name": "Pick Doctor Rows",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ 650, -60 ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [],
+          "number": [],
+          "string": [
+            {
+              "value1": "={{$json[\"doctorRows\"].length.toString()}}",
+              "operation": "notEqual",
+              "value2": "0"
+            }
+          ]
+        }
+      },
+      "id": "IF_DoctorsFound",
+      "name": "IF: Any Doctor Found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [ 880, -60 ]
+    },
+    {
+      "parameters": {
+        "functionCode": "/*\nCompute the next valid slot.\n- Use first matching doctor row for now (you can expand to let AI choose if multiple)\n- Parse SittingDaysCSV -> [Mon, Tue, ...]\n- If parsed.asap === true, propose next slot today within Start-End if day matches; otherwise next matching day.\n- If requestedDate/Time provided, snap to that if within window.\nReturns: booking object { doctor, date, time, isoDateTime }\n*/\n\nfunction parseTime(s){\n  const [hh, mm] = (s||\"00:00\").split(\":\").map(Number); return {hh, mm};\n}\n\nfunction nextMatchingDay(from, allowedDays){\n  const map = {Sun:0, Mon:1, Tue:2, Wed:3, Thu:4, Fri:5, Sat:6};\n  const set = new Set(allowedDays.map(d=>d.trim()));\n  for (let i=0;i<14;i++){\n    const d = new Date(from.getTime() + i*24*3600*1000);\n    const day = [\"Sun\",\"Mon\",\"Tue\",\"Wed\",\"Thu\",\"Fri\",\"Sat\"][d.getDay()];\n    if (set.has(day)) return d;\n  }\n  return null;\n}\n\nconst { parsed, doctorRows } = items[0].json;\nif (!doctorRows || !doctorRows.length) return items;\n\n// Normalize row keys across Google Sheets node versions\nconst r = doctorRows[0];\nconst DoctorID = r.A || r.DoctorID || r[\"Column 1\"]; \nconst Name = r.B || r.Name || r[\"Column 2\"]; \nconst Specialty = r.C || r.Specialty || r[\"Column 3\"]; \nconst SittingDaysCSV = r.D || r.SittingDaysCSV || r[\"Column 4\"]; \nconst StartTime24h = r.E || r.StartTime24h || r[\"Column 5\"]; \nconst EndTime24h = r.F || r.EndTime24h || r[\"Column 6\"]; \nconst SlotMinutes = Number(r.G || r.SlotMinutes || r[\"Column 7\"] || 20);\nconst Location = r.H || r.Location || r[\"Column 8\"]; \n\nconst tz = 'Asia/Karachi';\nconst now = new Date(parsed.nowISO);\nlet targetDate = parsed.requestedDate ? new Date(parsed.requestedDate) : null;\nconst reqTime = parsed.requestedTime;\nconst days = (SittingDaysCSV||\"\").split(',').map(s=>s.trim());\n\nlet dayToUse;\nif (parsed.asap || !targetDate) {\n  dayToUse = nextMatchingDay(now, days);\n} else {\n  dayToUse = nextMatchingDay(targetDate, days);\n}\n\nif (!dayToUse) return [{json:{error:\"No sitting day available.\", parsed}}];\n\n// choose time\nconst {hh:sh, mm:sm} = parseTime(StartTime24h);\nconst {hh:eh, mm:em} = parseTime(EndTime24h);\n\nlet slot = new Date(dayToUse);\nif (parsed.asap) {\n  // next slot >= now but within window; else first slot of that day\n  const windowStart = new Date(dayToUse); windowStart.setHours(sh,sm,0,0);\n  const windowEnd = new Date(dayToUse); windowEnd.setHours(eh,em,0,0);\n  slot = now < windowStart ? windowStart : now;\n  // round up to next SlotMinutes\n  const minutes = slot.getMinutes();\n  const mod = minutes % SlotMinutes; \n  if (mod !== 0) slot.setMinutes(minutes + (SlotMinutes - mod), 0, 0);\n  if (slot > windowEnd) {\n    // move to next matching day at windowStart\n    const nextDay = nextMatchingDay(new Date(dayToUse.getTime()+24*3600*1000), days);\n    if (!nextDay) return [{json:{error:\"No further days available.\", parsed}}];\n    slot = new Date(nextDay); slot.setHours(sh,sm,0,0);\n  }\n} else if (reqTime) {\n  const [rh, rm] = reqTime.split(':').map(Number);\n  slot.setHours(rh, rm||0, 0, 0);\n  const wS = new Date(dayToUse); wS.setHours(sh,sm,0,0);\n  const wE = new Date(dayToUse); wE.setHours(eh,em,0,0);\n  if (slot < wS || slot > wE) {\n    slot = wS; // snap to start\n  }\n} else {\n  slot.setHours(sh,sm,0,0);\n}\n\nconst yyyy = slot.getFullYear();\nconst mm = String(slot.getMonth()+1).padStart(2,'0');\nconst dd = String(slot.getDate()).padStart(2,'0');\nconst hh = String(slot.getHours()).padStart(2,'0');\nconst mi = String(slot.getMinutes()).padStart(2,'0');\n\nreturn [{ json: {\n  parsed,\n  doctor: { DoctorID, Name, Specialty, Location, SittingDaysCSV, StartTime24h, EndTime24h, SlotMinutes },\n  booking: {\n    date: `${yyyy}-${mm}-${dd}`,\n    time: `${hh}:${mi}`,\n    isoDateTime: slot.toISOString()\n  }\n}}];"
+      },
+      "id": "ComputeSlot",
+      "name": "Compute Next Slot",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ 1120, -160 ]
+    },
+    {
+      "parameters": {
+        "functionCode": "const { parsed, doctor } = items[0].json;\nif (!doctor) return [{json:{ error:\"No doctor resolved\", parsed }}];\nreturn items;"
+      },
+      "id": "Guard_DoctorResolved",
+      "name": "Guard: Doctor Resolved",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ 1120, 40 ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "sheetId": "REPLACE_WITH_YOUR_SPREADSHEET_ID",
+        "range": "Appointments!A:K",
+        "options": {
+          "locationDefine": "range"
+        },
+        "valueInputMode": "RAW",
+        "values": "={{[\n  new Date().toISOString(),\n  $json.parsed.patientName || \"\",\n  $json.parsed.callerId || \"\",\n  $json.doctor.DoctorID || \"\",\n  $json.doctor.Name || \"\",\n  $json.doctor.Specialty || \"\",\n  $json.booking.date,\n  $json.booking.time,\n  $json.doctor.Location || \"\",\n  $json.parsed.message || \"\",\n  \"voice\"\n]}}"
+      },
+      "id": "GS_AppendAppointment",
+      "name": "GS: Append Appointment",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 5,
+      "position": [ 1390, -160 ],
+      "credentials": {
+        "googleApi": {
+          "id": "REPLACE_WITH_YOUR_GOOGLE_CRED_ID",
+          "name": "Google Service Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "functionCode": "if ($json.error) {\n  return [{json:{\n    tts: `Sorry, I couldn't find an available doctor for that request. Would you like me to try another day or specialty?` ,\n    success: false\n  }}];\n}\n\nconst p = $json.parsed;\nconst d = $json.doctor;\nconst b = $json.booking;\n\nconst name = p.patientName ? `${p.patientName}, ` : \"\";\nconst s = `Thanks ${name}your appointment is set with ${d.Name} (${d.Specialty}) on ${b.date} at ${b.time} at ${d.Location}. Should I text you the details as well?`;\n\nreturn [{ json: { tts: s, success: true } }];"
+      },
+      "id": "CraftVoiceReply",
+      "name": "Craft Voice Reply",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 2,
+      "position": [ 1650, -160 ]
+    },
+    {
+      "parameters": {
+        "responseBody": "={{$json.tts}}",
+        "responseCode": 200
+      },
+      "id": "RespondWebhook",
+      "name": "Respond to Webhook (TTS Text)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 2,
+      "position": [ 1870, -160 ]
+    },
+    {
+      "parameters": {
+        "responseBody": "={{$json.error || \"No doctor found for your query. Please specify doctor name or specialty.\"}}",
+        "responseCode": 200
+      },
+      "id": "Respond_NoDoctor",
+      "name": "Respond (No Doctor)",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 2,
+      "position": [ 1380, 60 ]
+    }
+  ],
+  "connections": {
+    "Webhook (Transcripts In)": {
+      "main": [
+        [
+          {
+            "node": "Normalize Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Input": {
+      "main": [
+        [
+          {
+            "node": "AI: Parse Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI: Parse Request": {
+      "main": [
+        [
+          {
+            "node": "Shape Parsed JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape Parsed JSON": {
+      "main": [
+        [
+          {
+            "node": "GS: Find Doctor (by Name)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "GS: Read All Doctors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GS: Find Doctor (by Name)": {
+      "main": [
+        [
+          {
+            "node": "Pick Doctor Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GS: Read All Doctors": {
+      "main": [
+        [
+          {
+            "node": "Pick Doctor Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Doctor Rows": {
+      "main": [
+        [
+          {
+            "node": "IF: Any Doctor Found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Any Doctor Found?": {
+      "main": [
+        [
+          {
+            "node": "Compute Next Slot",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond (No Doctor)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Next Slot": {
+      "main": [
+        [
+          {
+            "node": "GS: Append Appointment",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Guard: Doctor Resolved",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GS: Append Appointment": {
+      "main": [
+        [
+          {
+            "node": "Craft Voice Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guard: Doctor Resolved": {
+      "main": [
+        [
+          {
+            "node": "Respond (No Doctor)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Craft Voice Reply": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook (TTS Text)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "saveExecutionProgress": true
+  },
+  "staticData": null
+}
